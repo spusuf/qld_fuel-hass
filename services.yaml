@@ -1,0 +1,3 @@
+refresh_prices:
+  name: Refresh Prices
+  description: Manually triggers an update of fuel prices from the API.

@@ -1,0 +1,16 @@
+{
+    "domain": "qld_fuel",
+    "name": "Queensland Fuel Prices",
+    "codeowners": [
+        "@spusuf"
+    ],
+    "config_flow": true,
+    "documentation": "https://github.com/spusuf/qld-fuel-hass",
+    "iot_class": "cloud_polling",
+    "issue_tracker": "https://github.com/spusuf/qld-fuel-hass/issues",
+    "integration_type": "service",
+    "requirements": [
+        "aiohttp>=3.9.0"
+    ],
+    "version": "1.0.0"
+}
