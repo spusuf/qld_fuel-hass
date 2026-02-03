@@ -1,0 +1,7 @@
+{
+    "name": "Fuel Prices (Queensland, Australia)",
+    "content_in_root": true,
+    "homeassistant": "2024.1.0b0",
+    "render_readme": true,
+    "country": "AU"
+}
