@@ -1,0 +1,26 @@
+{
+    "config": {
+        "step": {
+            "user": {
+                "title": "QLD Fuel Setup",
+                "description": "Configure the stations and fuels to add to home assistant",
+                "data": {
+                    "subscriber_token": "Data Consumer Token",
+                    "radius": "Fuel Station Radius (km)",
+                    "fuel_types": "Fuel Types to Track",
+                    "scan_interval": "Update Interval (hours)"
+                }
+            },
+            "reconfigure": {
+                "title": "Reconfigure QLD Fuel",
+                "description": "Update the configuration for QLD Fuel.",
+                "data": {
+                    "subscriber_token": "Data Consumer Token",
+                    "radius": "Fuel Station Radius (km)",
+                    "fuel_types": "Fuel Types to Track",
+                    "scan_interval": "Update Interval (hours)"
+                }
+            }
+        }
+    }
+}
