@@ -9,6 +9,7 @@
     "iot_class": "cloud_polling",
     "issue_tracker": "https://github.com/spusuf/qld_fuel-hass/issues",
     "integration_type": "service",
+    "after_dependencies": ["recorder"],
     "requirements": [
         "aiohttp>=3.9.0"
     ],
