@@ -1,0 +1,13 @@
+__pycache__/
+*.py[codz]
+*$py.class
+
+.vscode/
+
+*.BACKUP
+
+# Not used but should block just in case
+.pybuilder/
+target/
+.env
+*.env
