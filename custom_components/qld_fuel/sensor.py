@@ -3,26 +3,55 @@ import logging
 
 from homeassistant.components.recorder import history, get_instance
 from homeassistant.components.sensor import SensorEntity, SensorStateClass
+from homeassistant.const import CONF_LATITUDE, CONF_LONGITUDE
 from homeassistant.core import callback
-from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
+from homeassistant.util.location import distance
 
 from .const import DOMAIN, FUEL_TYPES, FUEL_TYPES_OPTIONS
 
 _LOGGER = logging.getLogger(__name__)
 
+_RESERVED_DOMAIN_KEYS = {"raw_data", "last_fetch_time", "fetch_lock", "master_entry_id"}
+
+
+def get_fuel_data(data_dict, f_id):
+    """Helper to find fuel data by string fuel ID."""
+    if not data_dict:
+        return None
+    return data_dict.get(str(f_id))
+
+
+def _find_all_tracked_best(hass, fuel_id):
+    """Return the cheapest local price and its station data across all tracked zones."""
+    best_price = None
+    best_station = None
+    for key, coord in hass.data.get(DOMAIN, {}).items():
+        if key in _RESERVED_DOMAIN_KEYS:
+            continue
+        if hasattr(coord, "data") and coord.data:
+            local_best = get_fuel_data(coord.data.get("local_cheapest"), fuel_id)
+            if local_best and local_best.get("price") is not None:
+                price = float(local_best["price"])
+                if best_price is None or price < best_price:
+                    best_price = price
+                    best_station = local_best
+    return best_price, best_station
+
+
 async def async_setup_entry(hass, entry, async_add_entities):
-    """Set up the fuel sensors."""
-    coordinator = hass.data[DOMAIN][entry.entry_id]
+    """Set up the fuel sensors for this specific entry."""
+    domain_data = hass.data[DOMAIN]
+    coordinator = domain_data[entry.entry_id]
     entities = []
-    chosen_fuels = entry.data.get(FUEL_TYPES, [])
-    
-    _LOGGER.debug(f"Setting up sensors. Chosen fuels: {chosen_fuels}")
-    
-    registry = er.async_get(hass)
-    existing_entries = er.async_entries_for_config_entry(registry, entry.entry_id)
-    valid_unique_ids = set()
+
+    is_master = (
+        entry.data.get("is_master", False)
+        or domain_data.get("master_entry_id") == entry.entry_id
+    )
+    chosen_fuels = entry.options.get(FUEL_TYPES, entry.data.get(FUEL_TYPES, []))
 
     sites_data = coordinator.data.get("sites", {})
 
@@ -32,41 +61,22 @@ async def async_setup_entry(hass, entry, async_add_entities):
         for price_info in site_data["prices"]:
             f_id = str(price_info.get("FuelId"))
             if f_id in chosen_fuels:
-                unique_id = f"{site_id}_{f_id}"
-                valid_unique_ids.add(unique_id)
                 entities.append(FuelPriceSensor(coordinator, site_id, f_id))
-    
+
+    if is_master:
+        for f_id in chosen_fuels:
+            entities.append(QldFuelBestPriceSensor(coordinator, f_id, "global"))
+            entities.append(QldFuelBestPriceSensor(coordinator, f_id, "all_tracked"))
+
     for f_id in chosen_fuels:
-        # Cheapest QLD
-        entities.append(QldFuelBestPriceSensor(coordinator, f_id, "global"))
-        valid_unique_ids.add(f"best_price_global_{f_id}")
-        
-        # Cheapest Local
         entities.append(QldFuelBestPriceSensor(coordinator, f_id, "local"))
-        valid_unique_ids.add(f"best_price_local_{f_id}")
 
-    # Remove entities that are no longer valid (e.g. outside new radius)
-    for entity_entry in existing_entries:
-        if entity_entry.unique_id not in valid_unique_ids:
-            _LOGGER.debug(f"Removing old entity: {entity_entry.entity_id}")
-            registry.async_remove(entity_entry.entity_id)
-
-    # Clean up orphaned devices
-    from homeassistant.helpers import device_registry as dr
-    device_registry = dr.async_get(hass)
-    devices = dr.async_entries_for_config_entry(device_registry, entry.entry_id)
-    for device in devices:
-        device_entities = er.async_entries_for_device(registry, device.id, include_disabled_entities=True)
-        if not device_entities:
-            _LOGGER.debug(f"Removing orphaned device: {device.name}")
-            device_registry.async_remove_device(device.id)
-    
-    _LOGGER.debug(f"Adding {len(entities)} fuel price sensors")
     async_add_entities(entities)
 
+
 class QldFuelBestPriceSensor(CoordinatorEntity, SensorEntity):
-    """Sensor for reporting best prices (Global or Local)."""
-    
+    """Sensor for reporting best prices (Global, Local, or All Tracked)."""
+
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = "¢/L"
 
@@ -74,41 +84,97 @@ class QldFuelBestPriceSensor(CoordinatorEntity, SensorEntity):
         super().__init__(coordinator)
         self.fuel_id = fuel_id
         self.scope = scope
-        
+
         fuel_info = next((f for f in FUEL_TYPES_OPTIONS if f["value"] == fuel_id), {"label": fuel_id})
-        scope_label = "QLD" if scope == "global" else "Local"
-        
-        self._attr_name = f"Best {fuel_info['label']} ({scope_label})"
-        self._attr_unique_id = f"best_price_{scope}_{fuel_id}"
+
+        if scope == "global":
+            self._attr_name = f"Best {fuel_info['label']} in QLD"
+            self._attr_unique_id = f"{DOMAIN}_global_{fuel_id}"
+        elif scope == "all_tracked":
+            self._attr_name = f"Best {fuel_info['label']} in Tracked Areas"
+            self._attr_unique_id = f"{DOMAIN}_tracked_{fuel_id}"
+        else:
+            zone_id = coordinator.entry.data.get("zone", "unknown")
+            state = coordinator.hass.states.get(zone_id)
+            zone_name = state.name if state else "Unknown Zone"
+            self._attr_name = f"{fuel_info['label']} ({zone_name})"
+            self._attr_unique_id = f"{DOMAIN}_local_{coordinator.entry.entry_id}_{fuel_id}"
+
         self._attr_icon = "mdi:star-circle"
-        
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, f"best_{scope}")},
-            "name": f"Best Prices {scope_label}",
-            "manufacturer": "QLD Government",
-        }
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        if self.scope in ("global", "all_tracked"):
+            return DeviceInfo(
+                identifiers={(DOMAIN, "qld_statewide_global")},
+                name="Queensland Fuel Prices",
+                manufacturer="QLD Government",
+                model="Statewide Monitor",
+                entry_type=DeviceEntryType.SERVICE,
+            )
+
+        return DeviceInfo(
+            identifiers={(DOMAIN, f"zone_{self.coordinator.entry.entry_id}")},
+            name=self.coordinator.entry.title,
+            manufacturer="QLD Fuel API",
+            model="Local Zone Monitor",
+            entry_type=DeviceEntryType.SERVICE,
+        )
 
     @property
     def native_value(self):
-        data_key = "global_cheapest" if self.scope == "global" else "local_cheapest"
-        data = self.coordinator.data.get(data_key, {}).get(self.fuel_id)
-        if data:
-            return data.get("price")
-        return None
+        if self.scope == "global":
+            data = get_fuel_data(self.coordinator.data.get("global_cheapest"), self.fuel_id)
+            return data.get("price") if data else None
+
+        if self.scope == "all_tracked":
+            best_price, _ = _find_all_tracked_best(self.hass, self.fuel_id)
+            return best_price
+
+        data = get_fuel_data(self.coordinator.data.get("local_cheapest"), self.fuel_id)
+        return data.get("price") if data else None
 
     @property
     def extra_state_attributes(self):
-        data_key = "global_cheapest" if self.scope == "global" else "local_cheapest"
-        data = self.coordinator.data.get(data_key, {}).get(self.fuel_id)
-        if data:
-            return {
-                "station_name": data.get("name"),
-                "address": f"{data.get('address')} {data.get('postcode')}"
-            }
-        return {}
+        if self.scope == "global":
+            station_data = get_fuel_data(self.coordinator.data.get("global_cheapest"), self.fuel_id)
+        elif self.scope == "local":
+            station_data = get_fuel_data(self.coordinator.data.get("local_cheapest"), self.fuel_id)
+        else:
+            _, station_data = _find_all_tracked_best(self.hass, self.fuel_id)
+
+        if not station_data:
+            return {"status": f"No data for fuel_id {self.fuel_id} in {self.scope}"}
+
+        site_id = station_data.get("site_id")
+        if site_id is None:
+            return {"status": "Price found but site_id is missing"}
+
+        raw_data = self.hass.data.get(DOMAIN, {}).get("raw_data", {})
+        all_sites = raw_data.get("sites", [])
+        site_raw = next((s for s in all_sites if str(s.get("S")) == str(site_id)), None)
+
+        if not site_raw:
+            return {"status": f"Site {site_id} not found in raw data"}
+
+        h_lat = self.coordinator.entry.options.get(CONF_LATITUDE, self.coordinator.entry.data.get(CONF_LATITUDE))
+        h_lon = self.coordinator.entry.options.get(CONF_LONGITUDE, self.coordinator.entry.data.get(CONF_LONGITUDE))
+        s_lat = float(site_raw.get("Lat", 0))
+        s_lon = float(site_raw.get("Lng", 0))
+
+        dist_km = "N/A"
+        if h_lat and h_lon and s_lat != 0:
+            dist_km = round(distance(h_lat, h_lon, s_lat, s_lon) / 1000, 1)
+
+        return {
+            "station_name": site_raw.get("N", "Unknown"),
+            "address": f"{site_raw.get('A', '')} {site_raw.get('P', '')}".strip(),
+            "distance_km": dist_km,
+        }
+
 
 class FuelPriceSensor(CoordinatorEntity, SensorEntity):
-    """Representation of a Fuel Price Sensor with historical attributes."""
+    """Representation of a specific station's Fuel Price Sensor."""
 
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = "¢/L"
@@ -118,7 +184,7 @@ class FuelPriceSensor(CoordinatorEntity, SensorEntity):
         self.site_id = site_id
         self.fuel_id = fuel_id
         self._attr_icon = "mdi:gas-station"
-        
+
         self._14d_low = None
         self._14d_low_days = None
         self._14d_avg = None
@@ -128,141 +194,107 @@ class FuelPriceSensor(CoordinatorEntity, SensorEntity):
 
         fuel_info = next((f for f in FUEL_TYPES_OPTIONS if f["value"] == fuel_id), {"label": fuel_id})
         site = coordinator.data.get("sites", {}).get(site_id)
-        site_name = site['name'] if site else "Unknown"
-        
+        site_name = site["name"] if site else "Unknown"
+
         self._attr_name = f"{site_name} {fuel_info['label']}"
-        self._attr_unique_id = f"{fuel_id}_{site_id}"
-        
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, site_id)},
-            "name": site_name,
-            "manufacturer": "QLD Government",
-        }
+        self._attr_unique_id = f"{DOMAIN}_{coordinator.entry.entry_id}_{fuel_id}_{site_id}"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, f"zone_{self.coordinator.entry.entry_id}")},
+            name=self.coordinator.entry.title,
+            manufacturer="QLD Fuel API",
+            model="Local Zone Monitor",
+            entry_type=DeviceEntryType.SERVICE,
+        )
 
     @property
     def native_value(self):
-        """Return the current price from coordinator data."""
         site_data = self.coordinator.data.get("sites", {}).get(self.site_id, {})
         for p in site_data.get("prices", []):
             if str(p.get("FuelId")) == self.fuel_id:
                 return p.get("Price")
-        
         return None
 
     @property
-    def available(self) -> bool:
-        """Available only if price is within feasible range (not 0 or 999)."""
-        val = self.native_value
-        return val is not None and 0 < val < 9990
+    def extra_state_attributes(self):
+        site = self.coordinator.data.get("sites", {}).get(self.site_id, {})
+        stats = site.get("stats", {}).get(self.fuel_id, {})
+
+        attrs = {
+            "address": f"{site.get('address')} {site.get('postcode')}".strip(),
+            "distance": f"{site.get('distance')} km",
+            "fuel_id": self.fuel_id,
+            "difference_to_qld_cheapest": stats.get("qld_delta", 0),
+        }
+
+        if self._7d_low is not None:
+            attrs.update({
+                "7_day_low": f"{self._7d_low} ¢/L",
+                "7_day_average": f"{self._7d_avg} ¢/L",
+                "days_since_7_day_low": f"{self._7d_low_days} days",
+            })
+        if self._14d_low is not None:
+            attrs.update({
+                "14_day_low": f"{self._14d_low} ¢/L",
+                "14_day_average": f"{self._14d_avg} ¢/L",
+                "days_since_14_day_low": f"{self._14d_low_days} days",
+            })
+        return attrs
 
     async def async_added_to_hass(self):
-        """Handle entity which is about to be added to Hass."""
         await super().async_added_to_hass()
         await self._update_history()
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        """Update history stats whenever coordinator gets new data."""
         self.hass.async_create_task(self._update_history())
         super()._handle_coordinator_update()
 
     async def _update_history(self):
         """Query the recorder for historical lows and averages."""
+        if self.hass.is_stopping:
+            return
+
         now = dt_util.utcnow()
         start_time = now - timedelta(days=14)
-        
-        if not self.hass.is_stopping:
-            try:
-                state_history = await get_instance(self.hass).async_add_executor_job(
-                    history.get_significant_states, self.hass, start_time, None, [self.entity_id]
-                )
-            except (AttributeError, ValueError):
-                return
-            
-            if self.entity_id in state_history:
-                valid_points = []
-                for s in state_history[self.entity_id]:
-                    if s.state in ("unknown", "unavailable", "", None):
-                        continue
-                    try:
-                        val = float(s.state)
-                        valid_points.append((val, s.last_changed))
-                    except ValueError:
-                        continue
 
-                if valid_points:
-                    min_price, min_time = min(valid_points, key=lambda x: x[0])
-                    self._14d_low = min_price
-                    self._14d_low_days = (now - min_time).days
-                    
-                    prices_14d = [p[0] for p in valid_points]
-                    self._14d_avg = round(sum(prices_14d) / len(prices_14d), 1)
+        try:
+            state_history = await get_instance(self.hass).async_add_executor_job(
+                history.get_significant_states, self.hass, start_time, None, [self.entity_id]
+            )
+        except (AttributeError, ValueError) as err:
+            _LOGGER.debug("Could not retrieve history for %s: %s", self.entity_id, err)
+            self.async_write_ha_state()
+            return
 
-                    seven_days_ago = now - timedelta(days=7)
-                    recent_points_with_time = [p for p in valid_points if p[1] > seven_days_ago]
-                    
-                    if recent_points_with_time:
-                        prices_7d = [p[0] for p in recent_points_with_time]
-                        self._7d_avg = round(sum(prices_7d) / len(prices_7d), 1)
-                        
-                        min_7d_price, min_7d_time = min(recent_points_with_time, key=lambda x: x[0])
-                        self._7d_low = min_7d_price
-                        self._7d_low_days = (now - min_7d_time).days
-        
-        self.async_write_ha_state()
-
-    @property
-    def extra_state_attributes(self):
-        """Attributes for advanced price comparison."""
-        site = self.coordinator.data.get("sites", {}).get(self.site_id, {})
-        current_price = self.native_value
-        if current_price is None:
-            current_price = 0
-        else:
-            current_price = float(current_price)
-        
-        # Cross-integration comparison
-        all_fuel_entities = self.hass.states.async_all("sensor")
-        same_fuel_prices = []
-        for s in all_fuel_entities:
-            if s.state not in ("unknown", "unavailable"):
+        if self.entity_id in state_history:
+            valid_points = []
+            for s in state_history[self.entity_id]:
+                if s.state in ("unknown", "unavailable", "", None):
+                    continue
                 try:
-                    price = float(s.state)
-                    if s.attributes.get("fuel_id") == self.fuel_id and s.entity_id != self.entity_id:
-                         same_fuel_prices.append(price)
+                    valid_points.append((float(s.state), s.last_changed))
                 except ValueError:
                     continue
-        defined_delta = round(current_price - min(same_fuel_prices), 1) if same_fuel_prices else 0
 
-        stats = site.get("stats", {}).get(self.fuel_id, {})
+            if valid_points:
+                min_price = min(p[0] for p in valid_points)
+                min_time = max(p[1] for p in valid_points if p[0] == min_price)
 
-        attributes = {
-            "difference_to_qld_cheapest": stats.get("qld_delta", 0),
-            "difference_to_region_cheapest": defined_delta,
-            "address": f"{site.get('address')} {site.get('postcode')}",
-            "distance": f"{site.get('distance')} km",
-            "fuel_id": self.fuel_id
-        }
+                self._14d_low = min_price
+                self._14d_low_days = (now - min_time).days
+                self._14d_avg = round(sum(p[0] for p in valid_points) / len(valid_points), 1)
 
-        if self._7d_low:
-            attributes["7_day_low"] = f"{self._7d_low} ¢/L"
-            attributes["7_day_low_difference"] = f"{round(current_price - self._7d_low, 1)} ¢/L"
-        
-        if self._14d_low:
-            attributes["14_day_low"] = f"{self._14d_low} ¢/L"
-            attributes["14_day_low_difference"] = f"{round(current_price - self._14d_low, 1)} ¢/L"
-            
-        if self._7d_avg:
-            attributes["7_day_average"] = f"{self._7d_avg} ¢/L"
-            attributes["difference_to_7_day_average"] = f"{round(current_price - self._7d_avg, 1)} ¢/L"
-            
-        if self._14d_avg:
-            attributes["14_day_average"] = f"{self._14d_avg} ¢/L"
-            attributes["difference_to_14_day_average"] = f"{round(current_price - self._14d_avg, 1)} ¢/L"
+                seven_days_ago = now - timedelta(days=7)
+                recent_points = [p for p in valid_points if p[1] > seven_days_ago]
 
-        if self._7d_low_days is not None:
-             attributes["days_since_7_day_low"] = f"{self._7d_low_days} days"
-        if self._14d_low_days is not None:
-            attributes["days_since_14_day_low"] = f"{self._14d_low_days} days"
+                if recent_points:
+                    min_7d = min(p[0] for p in recent_points)
+                    min_7d_time = max(p[1] for p in recent_points if p[0] == min_7d)
+                    self._7d_low = min_7d
+                    self._7d_low_days = (now - min_7d_time).days
+                    self._7d_avg = round(sum(p[0] for p in recent_points) / len(recent_points), 1)
 
-        return attributes
+        self.async_write_ha_state()
