@@ -1,6 +1,6 @@
 from homeassistant.const import Platform
 
-DOMAIN="qld_fuel"
+DOMAIN = "qld_fuel"
 
 TOKEN = "subscriber_token"
 

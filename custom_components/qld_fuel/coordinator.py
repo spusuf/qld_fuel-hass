@@ -1,167 +1,179 @@
 import logging
 import asyncio
-import aiohttp
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from datetime import timedelta
+
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 from homeassistant.util.location import distance
+from homeassistant.const import CONF_LATITUDE, CONF_LONGITUDE
 
-from .const import DOMAIN, TOKEN, RADIUS, FUEL_TYPES, SCAN_INTERVAL
+from .const import DOMAIN, TOKEN, RADIUS, SCAN_INTERVAL
 
 _LOGGER = logging.getLogger(__name__)
 
+
 class QldFuelDataUpdateCoordinator(DataUpdateCoordinator):
-    """Class to manage fetching data from the Fuel Price API."""
+    """Manage fetching data; one shared API fetch is cached across all zone instances."""
 
     def __init__(self, hass, entry):
-        """Initialize."""
         self.entry = entry
-        
-        scan_interval = entry.data.get(SCAN_INTERVAL, 6)
-        
+
+        scan_interval = entry.options.get(
+            SCAN_INTERVAL, entry.data.get(SCAN_INTERVAL, 6)
+        )
+
         super().__init__(
             hass,
             _LOGGER,
-            name=DOMAIN,
-            update_interval=timedelta(hours=scan_interval),
+            name=f"{DOMAIN}_{entry.title}",
+            update_interval=timedelta(hours=float(scan_interval)),
         )
 
-
     async def _async_update_data(self):
-        """Fetch data from API."""
+        """Fetch data from API or use shared cache."""
+        domain_data = self.hass.data[DOMAIN]
+
+        if "fetch_lock" not in domain_data:
+            domain_data["fetch_lock"] = asyncio.Lock()
+
+        async with domain_data["fetch_lock"]:
+            last_fetch = domain_data.get("last_fetch_time")
+            now = dt_util.utcnow()
+
+            if last_fetch is None or (now - last_fetch) > timedelta(minutes=5):
+                _LOGGER.debug("Shared cache expired or empty. Fetching fresh data for %s", self.entry.title)
+                try:
+                    raw_data = await self._fetch_from_api()
+                    domain_data["raw_data"] = raw_data
+                    domain_data["last_fetch_time"] = now
+                except Exception as err:
+                    raise UpdateFailed(f"Error communicating with API: {err}") from err
+            else:
+                _LOGGER.debug("Using shared cache for %s", self.entry.title)
+
+            raw_data = domain_data["raw_data"]
+
+        return self._process_raw_data(raw_data)
+
+    async def _fetch_from_api(self):
+        """Perform the actual HTTP requests to the QLD Fuel API."""
         token = self.entry.data.get(TOKEN)
         if not token:
-            raise UpdateFailed("Subscriber Token is missing. Please delete and re-add the integration.")
-            
+            raise UpdateFailed("Subscriber Token is missing.")
+
         headers = {"Authorization": f"FPDAPI SubscriberToken={token}"}
-
         session = async_get_clientsession(self.hass)
-
         base_url = "https://fppdirectapi-prod.fuelpricesqld.com.au"
-        endpoints = {
-            "sites": f"{base_url}/Subscriber/GetFullSiteDetails?countryId=21&geoRegionLevel=3&geoRegionId=1",
-            # "brands": f"{base_url}/Subscriber/GetCountryBrands?countryId=21",
-            # "fuel_types": f"{base_url}/Subscriber/GetCountryFuelTypes?countryId=21",
-            "site_prices": f"{base_url}/Price/GetSitesPrices?countryId=21&geoRegionLevel=3&geoRegionId=1",
-        }
 
-        try:
-            async with asyncio.timeout(30):
-                responses = await asyncio.gather(*(session.get(url, headers=headers) for url in endpoints.values()))
-                
-                for r in responses:
-                    if r.status != 200:
-                        text = await r.text()
-                        raise UpdateFailed(f"API Error {r.status}: {text}")
+        async with asyncio.timeout(30):
+            urls = [
+                f"{base_url}/Subscriber/GetFullSiteDetails?countryId=21&geoRegionLevel=3&geoRegionId=1",
+                f"{base_url}/Price/GetSitesPrices?countryId=21&geoRegionLevel=3&geoRegionId=1",
+            ]
 
-                json_data = await asyncio.gather(*(r.json() for r in responses))
-                data_map = dict(zip(endpoints.keys(), json_data))
-            
-                raw_sites = data_map["sites"].get("S", [])
-                raw_prices = data_map["site_prices"].get("SitePrices", [])
-                
-                site_lookup = {str(s["S"]): s for s in raw_sites}
+            results = []
+            for url in urls:
+                async with session.get(url, headers=headers) as response:
+                    if response.status != 200:
+                        _LOGGER.error("QLD Fuel API returned status %s", response.status)
+                        raise UpdateFailed(f"API Error {response.status}")
+                    results.append(await response.json())
 
-                price_map = {}
-                global_cheapest = {}
+            return {
+                "sites": results[0].get("S", []),
+                "prices": results[1].get("SitePrices", []),
+            }
 
-                for p in raw_prices:
-                    price = p.get("Price", None)
-                    
-                    if price is None or price <= 0 or price >= 9990: continue
-                    
-                    price = price / 10.0
-                    p["Price"] = price
+    def _process_raw_data(self, raw_data):
+        """Transform raw JSON into the structured dict used by sensors."""
+        raw_sites = raw_data.get("sites", [])
+        raw_prices = raw_data.get("prices", [])
 
-                    f_id = str(p["FuelId"])
+        site_lookup = {str(s["S"]): s for s in raw_sites}
+        price_map = {}
+        global_cheapest = {}
 
-                    if f_id not in global_cheapest or price < global_cheapest[f_id]["price"]:
-                        s_id = str(p["SiteId"])
-                        s_info = site_lookup.get(s_id, {})
-                        global_cheapest[f_id] = {
-                            "price": price,
-                            "site_id": s_id,
-                            "name": s_info.get("N"),
-                            "address": s_info.get("A"),
-                            "postcode": s_info.get("P"),
-                            "brand_id": s_info.get("B")
-                        }
-                    
-                    site_id = str(p["SiteId"])
-                    price_map.setdefault(site_id, []).append(p)
-
-                return self._filter_data(raw_sites, price_map, global_cheapest)
-
-        except Exception as err:
-            _LOGGER.error(f"Error updating data: {err}")
-            raise UpdateFailed(f"QLD Fuel API error: {err}")
-
-    def _filter_data(self, sites, price_map, global_cheapest):
-        filtered_sites = {}
-        local_cheapest = {}
-        
-        home_lat, home_lon = self.hass.config.latitude, self.hass.config.longitude
-        
-        if home_lat is None or home_lon is None:
-            raise UpdateFailed("Home latitude or longitude not set in Home Assistant config.")
-
-        user_radius = self.entry.data[RADIUS]
-        
-        _LOGGER.debug(f"Filtering sites. Home: {home_lat}, {home_lon}. Radius: {user_radius}km. Total Sites: {len(sites)}")
-
-        sites_in_radius = 0
-
-        for i, site in enumerate(sites):
-            s_id = str(site.get("S"))
-            name = site.get("N")
-            address = site.get("A")
-            postcode = site.get("P")
-            
-            try:
-                site_lat = float(site.get("Lat"))
-                site_lon = float(site.get("Lng"))
-            except (TypeError, ValueError):
+        for p in raw_prices:
+            price_raw = p.get("Price")
+            if price_raw is None or not (1 < price_raw < 9990):
                 continue
 
-            dist = distance(home_lat, home_lon, site_lat, site_lon) / 1000
-            if dist <= user_radius:
-                sites_in_radius += 1
+            display_price = float(price_raw) / 10.0
+            f_id = str(p.get("FuelId"))
+            s_id = str(p.get("SiteId"))
 
-                stats = {}
-                site_prices = price_map.get(s_id, [])
-                for p in site_prices:
-                    f_id = str(p["FuelId"])
-                    price = p["Price"]
-                    
-                    stats[f_id] = {
-                        "qld_delta": round(price - global_cheapest.get(f_id, {}).get("price", price), 1)
-                    }
-                    
-                    if f_id not in local_cheapest or price < local_cheapest[f_id]["price"]:
-                        local_cheapest[f_id] = {
-                            "price": price,
-                            "site_id": s_id,
-                            "name": name,
-                            "address": address,
-                            "postcode": postcode,
-                            "distance": round(dist, 1)
-                        }
+            clean_price_entry = {
+                "FuelId": f_id,
+                "Price": display_price,
+                "SiteId": s_id,
+            }
 
-                filtered_sites[s_id] = {
-                    "name": name,
-                    "address": address,
-                    "postcode": postcode,
-                    "distance": round(dist, 1),
-                    "prices": site_prices,
-                    "stats": stats
+            if f_id not in global_cheapest or display_price < global_cheapest[f_id]["price"]:
+                s_info = site_lookup.get(s_id, {})
+                global_cheapest[f_id] = {
+                    "price": display_price,
+                    "site_id": s_id,
+                    "name": s_info.get("N"),
+                    "address": s_info.get("A"),
+                    "postcode": s_info.get("P"),
                 }
-        
-        if not filtered_sites:
-            _LOGGER.warning(f"No fuel stations found within {user_radius}km of home (Lat: {home_lat}, Lon: {home_lon}). Sites in range: {sites_in_radius}. Verify your HA General Configuration location settings.")
-            
+
+            price_map.setdefault(s_id, []).append(clean_price_entry)
+
+        return self._filter_to_zone(raw_sites, price_map, global_cheapest)
+
+    def _filter_to_zone(self, sites, price_map, global_cheapest):
+        """Filter stations within this entry's defined radius."""
+        filtered_sites = {}
+        local_cheapest = {}
+
+        lat = self.entry.options.get(CONF_LATITUDE, self.entry.data.get(CONF_LATITUDE, self.hass.config.latitude))
+        lon = self.entry.options.get(CONF_LONGITUDE, self.entry.data.get(CONF_LONGITUDE, self.hass.config.longitude))
+        radius = float(self.entry.options.get(RADIUS, self.entry.data.get(RADIUS, 5)))
+
+        for site in sites:
+            s_id = str(site.get("S"))
+            try:
+                s_lat, s_lon = float(site["Lat"]), float(site["Lng"])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            dist = distance(lat, lon, s_lat, s_lon) / 1000
+            if dist > radius:
+                continue
+
+            site_prices = price_map.get(s_id, [])
+            stats = {}
+
+            for p in site_prices:
+                f_id = str(p["FuelId"])
+                price = p["Price"]
+
+                stats[f_id] = {
+                    "qld_delta": round(price - global_cheapest.get(f_id, {}).get("price", price), 1)
+                }
+
+                if f_id not in local_cheapest or price < local_cheapest[f_id]["price"]:
+                    local_cheapest[f_id] = {
+                        "price": price,
+                        "site_id": s_id,
+                        "name": site.get("N"),
+                        "address": site.get("A"),
+                        "postcode": site.get("P"),
+                    }
+
+            filtered_sites[s_id] = {
+                "name": site.get("N"),
+                "address": site.get("A"),
+                "postcode": site.get("P"),
+                "distance": round(dist, 1),
+                "prices": site_prices,
+                "stats": stats,
+            }
+
         return {
             "sites": filtered_sites,
             "global_cheapest": global_cheapest,
-            "local_cheapest": local_cheapest
+            "local_cheapest": local_cheapest,
         }
