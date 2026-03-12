@@ -94,9 +94,9 @@ class QldFuelBestPriceSensor(CoordinatorEntity, SensorEntity):
             self._attr_name = f"Best {fuel_info['label']} in Tracked Areas"
             self._attr_unique_id = f"{DOMAIN}_tracked_{fuel_id}"
         else:
-            zone_id = coordinator.entry.data.get("zone", "unknown")
+            zone_id = coordinator.entry.data.get("zone", "zone.home")
             state = coordinator.hass.states.get(zone_id)
-            zone_name = state.name if state else "Unknown Zone"
+            zone_name = state.name if state else "Home"
             self._attr_name = f"{fuel_info['label']} ({zone_name})"
             self._attr_unique_id = f"{DOMAIN}_local_{coordinator.entry.entry_id}_{fuel_id}"
 
