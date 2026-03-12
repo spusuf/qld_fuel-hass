@@ -1,6 +1,9 @@
 {
     "domain": "qld_fuel",
     "name": "Queensland Fuel Prices",
+    "after_dependencies": [
+        "recorder"
+    ],
     "codeowners": [
         "@spusuf"
     ],
