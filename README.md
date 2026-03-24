@@ -2,6 +2,12 @@
 This integration is for users in Queensland, Australia and gives you sensors for the fuel stations in a (or multiple) areas and some statistics for your Home Assistant dashboards.
 It utilises the Queensland Government Mandatory Fuel Price Reporting Scheme's API (mouthful, I know)
 
+## Setup
+1. You will need to request a Data Consumer Token from this form: [Publisher and Data Consumer Sign Up](https://forms.office.com/Pages/ResponsePage.aspx?id=XbdJc0AKKUSHYhmf2mnq-9XqCWIciN5Osw2Y74gWzu9UQ0pCR1dPV0FWR1ZPN0FYSEc0UEVQMkQzMyQlQCN0PWcu)
+2. Install this integration via HACS [![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=spusuf&repository=qld_fuel-hass)
+3. Add the integration in home assistant
+
+
 ## Features
 - Automatically creates an entry for each station within a selectable radius from your home's location (will add location selector to allow second instance scanning near work, etc)
 - Allows you to select multiple fuel types you want added to home assistant
@@ -25,11 +31,6 @@ Each sensor has the following attributes:
 - Distance (in case you want to do a price delta vs distance graph)
 
 ![Preview of a sensor with its attributes](https://github.com/spusuf/qld_fuel-hass/blob/main/previews/preview1.jpg "Preview of sensor panel")
-
-## Setup
-1. You will need to request a Data Consumer Token from this form: [Publisher and Data Consumer Sign Up](https://forms.office.com/Pages/ResponsePage.aspx?id=XbdJc0AKKUSHYhmf2mnq-9XqCWIciN5Osw2Y74gWzu9UQ0pCR1dPV0FWR1ZPN0FYSEc0UEVQMkQzMyQlQCN0PWcu)
-2. Install this integration via HACS (for the time being you will need to add it as a custom repository in the top right of HACS).
-3. During configuration, enter your token, your vehicle's fuel type(s) and radius (if you are in a suburban area I recommend 2-4kms).
 
 
 
