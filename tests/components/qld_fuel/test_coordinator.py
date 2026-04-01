@@ -92,7 +92,7 @@ def _load_coordinator_module():
     package.__path__ = []  # mark as package
     sys.modules["custom_components.qld_fuel"] = package
 
-    path = Path("C:/Cursor IDE/qld_fuel-hass/custom_components/qld_fuel/coordinator.py")
+    path = Path(__file__).resolve().parents[3] / "custom_components" / "qld_fuel" / "coordinator.py"
     spec = importlib.util.spec_from_file_location(
         "custom_components.qld_fuel.coordinator",
         str(path),

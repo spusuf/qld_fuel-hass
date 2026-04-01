@@ -163,7 +163,7 @@ def _load_config_flow_module():
     package.__path__ = []
     sys.modules["custom_components.qld_fuel"] = package
 
-    path = Path("C:/Cursor IDE/qld_fuel-hass/custom_components/qld_fuel/config_flow.py")
+    path = Path(__file__).resolve().parents[3] / "custom_components" / "qld_fuel" / "config_flow.py"
     spec = importlib.util.spec_from_file_location(
         "custom_components.qld_fuel.config_flow",
         str(path),
