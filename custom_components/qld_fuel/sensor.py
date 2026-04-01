@@ -3,19 +3,18 @@ import logging
 
 from homeassistant.components.recorder import history, get_instance
 from homeassistant.components.sensor import SensorEntity, SensorStateClass
-from homeassistant.const import CONF_LATITUDE, CONF_LONGITUDE
 from homeassistant.core import callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 from homeassistant.util.location import distance
 
-from .const import DOMAIN, FUEL_TYPES, FUEL_TYPES_OPTIONS
+from .const import DOMAIN, FUEL_TYPES, FUEL_TYPES_OPTIONS, LOCATION_ENTITY, RADIUS
 
 _LOGGER = logging.getLogger(__name__)
 
-_RESERVED_DOMAIN_KEYS = {"raw_data", "last_fetch_time", "fetch_lock", "master_entry_id"}
-
+PARALLEL_UPDATES = 1
 
 def get_fuel_data(data_dict, f_id):
     """Helper to find fuel data by string fuel ID."""
@@ -28,9 +27,8 @@ def _find_all_tracked_best(hass, fuel_id):
     """Return the cheapest local price and its station data across all tracked zones."""
     best_price = None
     best_station = None
-    for key, coord in hass.data.get(DOMAIN, {}).items():
-        if key in _RESERVED_DOMAIN_KEYS:
-            continue
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        coord = entry.runtime_data
         if hasattr(coord, "data") and coord.data:
             local_best = get_fuel_data(coord.data.get("local_cheapest"), fuel_id)
             if local_best and local_best.get("price") is not None:
@@ -41,15 +39,19 @@ def _find_all_tracked_best(hass, fuel_id):
     return best_price, best_station
 
 
+def _resolve_location_source(entry):
+    """Return the configured location source entity for derived nearby sensors."""
+    return entry.options.get(LOCATION_ENTITY, entry.data.get(LOCATION_ENTITY))
+
+
 async def async_setup_entry(hass, entry, async_add_entities):
     """Set up the fuel sensors for this specific entry."""
-    domain_data = hass.data[DOMAIN]
-    coordinator = domain_data[entry.entry_id]
+    coordinator = entry.runtime_data
     entities = []
 
     is_master = (
         entry.data.get("is_master", False)
-        or domain_data.get("master_entry_id") == entry.entry_id
+        or hass.data[DOMAIN].get("master_entry_id") == entry.entry_id
     )
     chosen_fuels = entry.options.get(FUEL_TYPES, entry.data.get(FUEL_TYPES, []))
 
@@ -70,6 +72,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
 
     for f_id in chosen_fuels:
         entities.append(QldFuelBestPriceSensor(coordinator, f_id, "local"))
+        entities.append(QldFuelBestPriceSensor(coordinator, f_id, "nearby"))
 
     async_add_entities(entities)
 
@@ -93,6 +96,15 @@ class QldFuelBestPriceSensor(CoordinatorEntity, SensorEntity):
         elif scope == "all_tracked":
             self._attr_name = f"Best {fuel_info['label']} in Tracked Areas"
             self._attr_unique_id = f"{DOMAIN}_tracked_{fuel_id}"
+        elif scope == "nearby":
+            source_entity = _resolve_location_source(coordinator.entry)
+            source_name = "Selected location"
+            if source_entity:
+                source_state = coordinator.hass.states.get(source_entity)
+                if source_state:
+                    source_name = source_state.name
+            self._attr_name = f"Best {fuel_info['label']} near {source_name}"
+            self._attr_unique_id = f"{DOMAIN}_nearby_{coordinator.entry.entry_id}_{fuel_id}"
         else:
             zone_id = coordinator.entry.data.get("zone", "zone.home")
             state = coordinator.hass.states.get(zone_id)
@@ -131,8 +143,29 @@ class QldFuelBestPriceSensor(CoordinatorEntity, SensorEntity):
             best_price, _ = _find_all_tracked_best(self.hass, self.fuel_id)
             return best_price
 
+        if self.scope == "nearby":
+            data = get_fuel_data(self.coordinator.data.get("local_cheapest"), self.fuel_id)
+            return data.get("price") if data else None
+
         data = get_fuel_data(self.coordinator.data.get("local_cheapest"), self.fuel_id)
         return data.get("price") if data else None
+
+    def _find_station_entity_id(self, station_data):
+        """Best-effort lookup of the station sensor entity id."""
+        site_id = station_data.get("site_id")
+        if site_id is None:
+            return None
+
+        entity_registry = er.async_get(self.hass)
+        target_unique_id = (
+            f"{DOMAIN}_{self.coordinator.entry.entry_id}_{self.fuel_id}_{site_id}"
+        )
+        entity_id = entity_registry.async_get_entity_id(
+            "sensor",
+            DOMAIN,
+            target_unique_id,
+        )
+        return entity_id
 
     @property
     def extra_state_attributes(self):
@@ -140,10 +173,23 @@ class QldFuelBestPriceSensor(CoordinatorEntity, SensorEntity):
             station_data = get_fuel_data(self.coordinator.data.get("global_cheapest"), self.fuel_id)
         elif self.scope == "local":
             station_data = get_fuel_data(self.coordinator.data.get("local_cheapest"), self.fuel_id)
+        elif self.scope == "nearby":
+            station_data = get_fuel_data(self.coordinator.data.get("local_cheapest"), self.fuel_id)
         else:
             _, station_data = _find_all_tracked_best(self.hass, self.fuel_id)
 
         if not station_data:
+            if self.scope == "nearby":
+                return {
+                    "fuel_id": self.fuel_id,
+                    "search_radius_km": float(
+                        self.coordinator.entry.options.get(
+                            RADIUS, self.coordinator.entry.data.get(RADIUS, 5)
+                        )
+                    ),
+                    "source_tracker": _resolve_location_source(self.coordinator.entry),
+                    "reason": "no_stations_in_range",
+                }
             return {"status": f"No data for fuel_id {self.fuel_id} in {self.scope}"}
 
         site_id = station_data.get("site_id")
@@ -157,8 +203,7 @@ class QldFuelBestPriceSensor(CoordinatorEntity, SensorEntity):
         if not site_raw:
             return {"status": f"Site {site_id} not found in raw data"}
 
-        h_lat = self.coordinator.entry.options.get(CONF_LATITUDE, self.coordinator.entry.data.get(CONF_LATITUDE))
-        h_lon = self.coordinator.entry.options.get(CONF_LONGITUDE, self.coordinator.entry.data.get(CONF_LONGITUDE))
+        h_lat, h_lon, _ = self.coordinator._resolve_entry_coords()
         s_lat = float(site_raw.get("Lat", 0))
         s_lon = float(site_raw.get("Lng", 0))
 
@@ -166,7 +211,7 @@ class QldFuelBestPriceSensor(CoordinatorEntity, SensorEntity):
         if h_lat and h_lon and s_lat != 0:
             dist_km = round(distance(h_lat, h_lon, s_lat, s_lon) / 1000, 1)
 
-        return {
+        attrs = {
             "station_name": site_raw.get("N", "Unknown"),
             "address": f"{site_raw.get('A', '')} {site_raw.get('P', '')}".strip(),
             "latitude": s_lat,
@@ -174,6 +219,21 @@ class QldFuelBestPriceSensor(CoordinatorEntity, SensorEntity):
             "Location": f"{s_lat}, {s_lon}",
             "distance_km": dist_km,
         }
+        if self.scope == "nearby":
+            source_entity = _resolve_location_source(self.coordinator.entry)
+            attrs.update(
+                {
+                    "search_radius_km": float(
+                        self.coordinator.entry.options.get(
+                            RADIUS, self.coordinator.entry.data.get(RADIUS, 5)
+                        )
+                    ),
+                    "source_tracker": source_entity,
+                    "station_entity_id": self._find_station_entity_id(station_data),
+                    "reason": "ok",
+                }
+            )
+        return attrs
 
 
 class FuelPriceSensor(CoordinatorEntity, SensorEntity):

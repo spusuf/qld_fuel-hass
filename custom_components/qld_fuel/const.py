@@ -3,6 +3,8 @@ from homeassistant.const import Platform
 DOMAIN = "qld_fuel"
 
 TOKEN = "subscriber_token"
+LOCATION_ENTITY = "location_entity"
+ZONE = "zone"
 
 RADIUS = "radius"
 

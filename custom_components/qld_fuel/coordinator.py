@@ -3,14 +3,49 @@ import asyncio
 from datetime import timedelta
 
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.core import callback
 from homeassistant.util import dt as dt_util
 from homeassistant.util.location import distance
 from homeassistant.const import CONF_LATITUDE, CONF_LONGITUDE
 
-from .const import DOMAIN, TOKEN, RADIUS, SCAN_INTERVAL
+from .const import DOMAIN, TOKEN, RADIUS, SCAN_INTERVAL, LOCATION_ENTITY, ZONE
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class QldFuelAuthError(Exception):
+    """Raised when token authentication fails."""
+
+
+class QldFuelConnectionError(Exception):
+    """Raised when the API cannot be reached."""
+
+
+async def async_validate_token(hass, token):
+    """Validate subscriber token by calling a lightweight authenticated endpoint."""
+    if not token:
+        raise QldFuelAuthError("Subscriber token is missing")
+
+    headers = {"Authorization": f"FPDAPI SubscriberToken={token}"}
+    session = async_get_clientsession(hass)
+    url = (
+        "https://fppdirectapi-prod.fuelpricesqld.com.au/"
+        "Subscriber/GetFullSiteDetails?countryId=21&geoRegionLevel=3&geoRegionId=1"
+    )
+
+    try:
+        async with asyncio.timeout(30):
+            async with session.get(url, headers=headers) as response:
+                if response.status in (401, 403):
+                    raise QldFuelAuthError(f"Auth failed with status {response.status}")
+                if response.status != 200:
+                    raise QldFuelConnectionError(f"API returned status {response.status}")
+    except QldFuelAuthError:
+        raise
+    except Exception as err:
+        raise QldFuelConnectionError(str(err)) from err
 
 
 class QldFuelDataUpdateCoordinator(DataUpdateCoordinator):
@@ -18,6 +53,7 @@ class QldFuelDataUpdateCoordinator(DataUpdateCoordinator):
 
     def __init__(self, hass, entry):
         self.entry = entry
+        self._remove_location_listener = None
 
         scan_interval = entry.options.get(
             SCAN_INTERVAL, entry.data.get(SCAN_INTERVAL, 6)
@@ -29,6 +65,91 @@ class QldFuelDataUpdateCoordinator(DataUpdateCoordinator):
             name=f"{DOMAIN}_{entry.title}",
             update_interval=timedelta(hours=float(scan_interval)),
         )
+
+    @staticmethod
+    def _coords_from_state(state):
+        """Extract and normalize lat/lon from an entity state."""
+        if not state:
+            return None, None
+
+        lat = state.attributes.get("latitude")
+        lon = state.attributes.get("longitude")
+        if lat is None or lon is None:
+            return None, None
+
+        try:
+            return float(lat), float(lon)
+        except (TypeError, ValueError):
+            return None, None
+
+    def _resolve_entry_coords(self):
+        """Resolve coordinates from location entity, then zone, then stored values."""
+        location_entity = self.entry.options.get(
+            LOCATION_ENTITY, self.entry.data.get(LOCATION_ENTITY)
+        )
+        if location_entity:
+            location_state = self.hass.states.get(location_entity)
+            lat, lon = self._coords_from_state(location_state)
+            if lat is not None and lon is not None:
+                return lat, lon, location_entity
+
+        zone_entity = self.entry.options.get(ZONE, self.entry.data.get(ZONE))
+        if zone_entity:
+            zone_state = self.hass.states.get(zone_entity)
+            lat, lon = self._coords_from_state(zone_state)
+            if lat is not None and lon is not None:
+                return lat, lon, zone_entity
+
+        lat = self.entry.options.get(
+            CONF_LATITUDE, self.entry.data.get(CONF_LATITUDE, self.hass.config.latitude)
+        )
+        lon = self.entry.options.get(
+            CONF_LONGITUDE, self.entry.data.get(CONF_LONGITUDE, self.hass.config.longitude)
+        )
+        try:
+            return float(lat), float(lon), None
+        except (TypeError, ValueError):
+            return None, None, None
+
+    async def async_setup_location_listener(self):
+        """Track location entity changes and recompute local derived data from cache."""
+        if self._remove_location_listener is not None:
+            return
+
+        location_entity = self.entry.options.get(
+            LOCATION_ENTITY, self.entry.data.get(LOCATION_ENTITY)
+        )
+        if not location_entity:
+            return
+
+        @callback
+        def _location_changed(event):
+            new_state = event.data.get("new_state")
+            old_state = event.data.get("old_state")
+            new_lat, new_lon = self._coords_from_state(new_state)
+            old_lat, old_lon = self._coords_from_state(old_state)
+            if (new_lat, new_lon) == (old_lat, old_lon):
+                return
+            self.hass.async_create_task(self.async_recompute_from_cache())
+
+        self._remove_location_listener = async_track_state_change_event(
+            self.hass,
+            [location_entity],
+            _location_changed,
+        )
+
+    async def async_recompute_from_cache(self):
+        """Recompute derived local data only, using cached API payload."""
+        raw_data = self.hass.data.get(DOMAIN, {}).get("raw_data")
+        if not raw_data:
+            return
+        self.async_set_updated_data(self._process_raw_data(raw_data))
+
+    async def async_shutdown(self):
+        """Remove listeners on unload."""
+        if self._remove_location_listener is not None:
+            self._remove_location_listener()
+            self._remove_location_listener = None
 
     async def _async_update_data(self):
         """Fetch data from API or use shared cache."""
@@ -75,9 +196,12 @@ class QldFuelDataUpdateCoordinator(DataUpdateCoordinator):
             results = []
             for url in urls:
                 async with session.get(url, headers=headers) as response:
+                    if response.status in (401, 403):
+                        _LOGGER.error("QLD Fuel API authentication failed with status %s", response.status)
+                        raise QldFuelAuthError(f"API auth error {response.status}")
                     if response.status != 200:
                         _LOGGER.error("QLD Fuel API returned status %s", response.status)
-                        raise UpdateFailed(f"API Error {response.status}")
+                        raise QldFuelConnectionError(f"API Error {response.status}")
                     results.append(await response.json())
 
             return {
@@ -130,8 +254,13 @@ class QldFuelDataUpdateCoordinator(DataUpdateCoordinator):
         filtered_sites = {}
         local_cheapest = {}
 
-        lat = self.entry.options.get(CONF_LATITUDE, self.entry.data.get(CONF_LATITUDE, self.hass.config.latitude))
-        lon = self.entry.options.get(CONF_LONGITUDE, self.entry.data.get(CONF_LONGITUDE, self.hass.config.longitude))
+        lat, lon, _ = self._resolve_entry_coords()
+        if lat is None or lon is None:
+            return {
+                "sites": {},
+                "global_cheapest": global_cheapest,
+                "local_cheapest": {},
+            }
         radius = float(self.entry.options.get(RADIUS, self.entry.data.get(RADIUS, 5)))
 
         for site in sites:
