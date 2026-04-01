@@ -117,6 +117,8 @@ class QldFuelDataUpdateCoordinator(DataUpdateCoordinator):
                     "name": s_info.get("N"),
                     "address": s_info.get("A"),
                     "postcode": s_info.get("P"),
+                    "latitude": s_info.get("Lat"),
+                    "longitude": s_info.get("Lng"),
                 }
 
             price_map.setdefault(s_id, []).append(clean_price_entry)
@@ -161,12 +163,16 @@ class QldFuelDataUpdateCoordinator(DataUpdateCoordinator):
                         "name": site.get("N"),
                         "address": site.get("A"),
                         "postcode": site.get("P"),
+                        "latitude": site.get("Lat"),
+                        "longitude": site.get("Lng"),
                     }
 
             filtered_sites[s_id] = {
                 "name": site.get("N"),
                 "address": site.get("A"),
                 "postcode": site.get("P"),
+                "latitude": s_lat,
+                "longitude": s_lon,
                 "distance": round(dist, 1),
                 "prices": site_prices,
                 "stats": stats,
