@@ -169,6 +169,9 @@ class QldFuelBestPriceSensor(CoordinatorEntity, SensorEntity):
         return {
             "station_name": site_raw.get("N", "Unknown"),
             "address": f"{site_raw.get('A', '')} {site_raw.get('P', '')}".strip(),
+            "latitude": s_lat,
+            "longitude": s_lon,
+            "Location": f"{s_lat}, {s_lon}",
             "distance_km": dist_km,
         }
 
@@ -224,10 +227,14 @@ class FuelPriceSensor(CoordinatorEntity, SensorEntity):
 
         attrs = {
             "address": f"{site.get('address')} {site.get('postcode')}".strip(),
+            "latitude": site.get("latitude"),
+            "longitude": site.get("longitude"),
             "distance": f"{site.get('distance')} km",
             "fuel_id": self.fuel_id,
             "difference_to_qld_cheapest": stats.get("qld_delta", 0),
         }
+        if site.get("latitude") is not None and site.get("longitude") is not None:
+            attrs["Location"] = f"{site.get('latitude')}, {site.get('longitude')}"
 
         if self._7d_low is not None:
             attrs.update({
