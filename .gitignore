@@ -11,3 +11,7 @@ __pycache__/
 target/
 .env
 *.env
+.venv/
+.pytest_cache/
+.coverage
+.cursor/

@@ -1,8 +1,30 @@
-from homeassistant.core import HomeAssistant, ServiceCall
+import asyncio
+import logging
+from collections.abc import Iterator
+from typing import Any
+
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.exceptions import HomeAssistantError
+try:
+    from homeassistant.helpers.update_coordinator import UpdateFailed
+except ImportError:  # pragma: no cover - test stubs may omit helpers module
+    UpdateFailed = HomeAssistantError
+
 from .const import DOMAIN, PLATFORMS
 from .coordinator import QldFuelDataUpdateCoordinator
-from .sensor import _RESERVED_DOMAIN_KEYS
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _iter_runtime_coordinators(
+    hass: HomeAssistant,
+) -> Iterator[QldFuelDataUpdateCoordinator]:
+    """Yield loaded coordinators from config entry runtime data."""
+    for config_entry in hass.config_entries.async_entries(DOMAIN):
+        coordinator = config_entry.runtime_data
+        if isinstance(coordinator, QldFuelDataUpdateCoordinator):
+            yield coordinator
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -11,16 +33,33 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = QldFuelDataUpdateCoordinator(hass, entry)
 
     await coordinator.async_config_entry_first_refresh()
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
+    await coordinator.async_setup_location_listener()
 
     if entry.data.get("is_master") or "master_entry_id" not in hass.data[DOMAIN]:
         hass.data[DOMAIN]["master_entry_id"] = entry.entry_id
 
     if not hass.services.has_service(DOMAIN, "refresh_prices"):
-        async def handle_manual_refresh(call: ServiceCall):
-            for coord in hass.data[DOMAIN].values():
-                if isinstance(coord, QldFuelDataUpdateCoordinator):
+        async def handle_manual_refresh(call: ServiceCall) -> None:
+            failed_entry_ids: list[str] = []
+            for coord in _iter_runtime_coordinators(hass):
+                try:
                     await coord.async_request_refresh()
+                except asyncio.CancelledError:
+                    raise
+                except (HomeAssistantError, UpdateFailed, Exception):  # pragma: no cover
+                    entry_id = getattr(coord.entry, "entry_id", "unknown")
+                    failed_entry_ids.append(entry_id)
+                    _LOGGER.warning(
+                        "Manual refresh failed for QLD Fuel entry '%s'",
+                        entry_id,
+                    )
+
+            if failed_entry_ids:
+                _LOGGER.warning(
+                    "Manual refresh completed with failures for QLD Fuel entries: %s",
+                    ", ".join(failed_entry_ids),
+                )
 
         hass.services.async_register(DOMAIN, "refresh_prices", handle_manual_refresh)
 
@@ -33,24 +72,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    unload_ok = bool(await hass.config_entries.async_unload_platforms(entry, PLATFORMS))
 
     if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id, None)
+        coord = entry.runtime_data
+        if isinstance(coord, QldFuelDataUpdateCoordinator):
+            await coord.async_shutdown()
+        entry.runtime_data = None
 
         if hass.data[DOMAIN].get("master_entry_id") == entry.entry_id:
             remaining = [
-                k for k in hass.data[DOMAIN]
-                if k not in _RESERVED_DOMAIN_KEYS
+                config_entry
+                for config_entry in hass.config_entries.async_entries(DOMAIN)
+                if config_entry.entry_id != entry.entry_id
             ]
             if remaining:
-                next_master = remaining[0]
-                hass.data[DOMAIN]["master_entry_id"] = next_master
-                coord = hass.data[DOMAIN].get(next_master)
-                if isinstance(coord, QldFuelDataUpdateCoordinator):
+                next_master_entry = remaining[0]
+                hass.data[DOMAIN]["master_entry_id"] = next_master_entry.entry_id
+                next_coord = next_master_entry.runtime_data
+                if isinstance(next_coord, QldFuelDataUpdateCoordinator):
                     hass.config_entries.async_update_entry(
-                        coord.entry,
-                        data={**coord.entry.data, "is_master": True},
+                        next_coord.entry,
+                        data={**next_coord.entry.data, "is_master": True},
                     )
             else:
                 hass.data.pop(DOMAIN)
@@ -63,3 +106,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Handle options update."""
     await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, entry: ConfigEntry, device_entry: Any
+) -> bool:
+    """Allow cleanup of stale devices tied to this config entry."""
+    return True

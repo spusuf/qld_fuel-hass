@@ -1,0 +1,24 @@
+{
+    "entity": {
+        "sensor": {
+            "best_price_global": {
+                "default": "mdi:star-circle"
+            },
+            "best_price_all_tracked": {
+                "default": "mdi:star-circle"
+            },
+            "best_price_nearby": {
+                "default": "mdi:star-circle"
+            },
+            "best_price_local": {
+                "default": "mdi:star-circle"
+            },
+            "station_fuel_price": {
+                "default": "mdi:gas-station"
+            },
+            "last_api_response": {
+                "default": "mdi:cloud-check-outline"
+            }
+        }
+    }
+}
